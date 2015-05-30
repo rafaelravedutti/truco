@@ -6,12 +6,15 @@
 #include <ctype.h>
 #include <netdb.h>
 #include <netinet/in.h>
-#include <pthread.h>
+#include <time.h>
 
-#define MESSAGE_TYPE_BAT          0x1
-#define MESSAGE_TYPE_FACED_CARD   0x2
-#define MESSAGE_TYPE_SEND_CARD    0x3
-#define MESSAGE_TYPE_PLAY         0x4
+#define MESSAGE_TYPE_BAT            0x1
+#define MESSAGE_TYPE_FACED_CARD     0x2
+#define MESSAGE_TYPE_SEND_CARD      0x3
+#define MESSAGE_TYPE_PLAY           0x4
+#define MESSAGE_TYPE_RESET_WINNER   0x5
+
+#define NO_CARD                     ((unsigned char) -1)
 
 struct message {
   char source;
@@ -156,14 +159,6 @@ void send_message(struct connection_data *condata, char dest, unsigned char card
   current_seq = (current_seq + 1) % 0xFF;
 }
 
-void send_bat(struct connection_data *condata) {
-  struct message msg;
-
-  msg.type = MESSAGE_TYPE_BAT;
-  msg.dest = 0;
-  sendto(condata->sock, &msg, sizeof(struct message), 0, (struct sockaddr *) &condata->sndaddr, sizeof(struct sockaddr_in));
-}
-
 void distribute_cards(struct connection_data *condata, unsigned char *my_cards, unsigned char *faced_card) {
   unsigned char game_cards[13];
   unsigned int i;
@@ -190,7 +185,34 @@ void distribute_cards(struct connection_data *condata, unsigned char *my_cards, 
   send_message(condata, 0, game_cards[12], MESSAGE_TYPE_FACED_CARD);
 }
 
-void play_card(struct connection_data *condata, unsigned char *my_cards) {
+void process_play(char card_owner, unsigned char card, unsigned char faced_card, char *winner, unsigned char *highest_card) {
+  unsigned char card_tag, highest_tag, faced_tag, best_tag;
+
+  if(*highest_card == NO_CARD) {
+    *highest_card = card;
+    *winner = card_owner;
+    return;
+  }
+
+  card_tag = get_card_tag(card);
+  highest_tag = get_card_tag(*highest_card);
+  faced_tag = get_card_tag(faced_card);
+  best_tag = (faced_tag + 1) % 10;
+
+  if(highest_tag != best_tag) {
+    if(card_tag == best_tag || card_tag > highest_tag) {
+      *highest_card = card;
+      *winner = card_owner;
+    }
+  } else {
+    if(card_tag == best_tag && get_card_suit(card) > get_card_suit(*highest_card)) {
+      *highest_card = card;
+      *winner = card_owner;
+    }
+  }
+}
+
+void play_card(struct connection_data *condata, unsigned char *my_cards, unsigned char faced_card, char *winner, unsigned char *highest_card) {
   unsigned char tag, suit;
   unsigned int card_index;
 
@@ -207,21 +229,23 @@ void play_card(struct connection_data *condata, unsigned char *my_cards) {
   fprintf(stdout, "Jogador %c jogou %c de %s\n", MACHINE_TAG, cards_tag[tag], cards_suit[suit]);
   send_message(condata, 0, my_cards[card_index - 1], MESSAGE_TYPE_PLAY);
 
+  process_play(MACHINE_TAG, my_cards[card_index - 1], faced_card, winner, highest_card);
   my_cards[card_index - 1] |= 0x80;
-  send_bat(condata);
 }
 
 int main(int argc, const char *argv[]) {
   struct connection_data condata;
   struct message msg;
+  char winner;
   unsigned char my_cards[3];
-  unsigned char faced_card, tag, suit, count = 0;
+  unsigned char faced_card, highest_card, tag, suit, count = 0;
   socklen_t recvlen;
 
   if(confighost(&condata) < 0) {
     return -1;
   }
 
+  highest_card = NO_CARD;
   srand(time(NULL));
 
   #ifdef START_BAT
@@ -234,7 +258,12 @@ int main(int argc, const char *argv[]) {
   suit = get_card_suit(faced_card);
   fprintf(stdout, "Carta virada: %c de %s\n", cards_tag[tag], cards_suit[suit]);
 
-  play_card(&condata, my_cards);
+  play_card(&condata, my_cards, faced_card, &winner, &highest_card);
+
+  msg.type = MESSAGE_TYPE_BAT;
+  msg.source = MACHINE_TAG;
+  msg.dest = 0;
+  sendto(condata.sock, &msg, sizeof(struct message), 0, (struct sockaddr *) &condata.sndaddr, sizeof(struct sockaddr_in));
 
   #endif
 
@@ -247,7 +276,24 @@ int main(int argc, const char *argv[]) {
       if(msg.dest == 0 || msg.dest == MACHINE_TAG) {
         switch(msg.type) {
           case MESSAGE_TYPE_BAT:
-            play_card(&condata, my_cards);
+            if(msg.source == MACHINE_TAG) {
+              msg.dest = winner;
+              highest_card = NO_CARD;
+              fprintf(stdout, "Jogador %c venceu esta rodada!\n", winner);
+
+              send_message(&condata, 0, 0, MESSAGE_TYPE_RESET_WINNER);
+            }
+
+            if(msg.dest == 0) {
+              play_card(&condata, my_cards, faced_card, &winner, &highest_card);
+            } else if(msg.dest == MACHINE_TAG) {
+              msg.source = msg.dest;
+              msg.dest = 0;
+
+              play_card(&condata, my_cards, faced_card, &winner, &highest_card);
+            }
+
+            sendto(condata.sock, &msg, sizeof(struct message), 0, (struct sockaddr *) &condata.sndaddr, sizeof(struct sockaddr_in));
             break;
 
           case MESSAGE_TYPE_FACED_CARD:
@@ -272,6 +318,13 @@ int main(int argc, const char *argv[]) {
             tag = get_card_tag(msg.card);
             suit = get_card_suit(msg.card);
             fprintf(stdout, "Jogador %c jogou %c de %s\n", msg.source, cards_tag[tag], cards_suit[suit]);
+
+            process_play(msg.source, msg.card, faced_card, &winner, &highest_card);
+            break;
+
+          case MESSAGE_TYPE_RESET_WINNER:
+            highest_card = NO_CARD;
+            fprintf(stdout, "Jogador %c venceu esta rodada!\n", winner);
             break;
         }
       }
