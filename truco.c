@@ -42,7 +42,7 @@ static char cards_tag[] = {
   '3'
 };
 
-static char cards_suit[][7] = {
+static char cards_suit[][8] = {
   "Ouros",
   "Espadas",
   "Copas",
@@ -96,7 +96,7 @@ int is_card_avaiable(unsigned char card) {
 }
 
 unsigned char get_card_tag(unsigned char card) {
-  return (card >> 2) & 0x10;
+  return (card >> 2) & 0x1F;
 }
 
 unsigned char get_card_suit(unsigned char card) {
@@ -156,7 +156,15 @@ void send_message(struct connection_data *condata, char dest, unsigned char card
   current_seq = (current_seq + 1) % 0xFF;
 }
 
-void distribute_cards(struct connection_data *condata, unsigned char *my_cards) {
+void send_bat(struct connection_data *condata) {
+  struct message msg;
+
+  msg.type = MESSAGE_TYPE_BAT;
+  msg.dest = 0;
+  sendto(condata->sock, &msg, sizeof(struct message), 0, (struct sockaddr *) &condata->sndaddr, sizeof(struct sockaddr_in));
+}
+
+void distribute_cards(struct connection_data *condata, unsigned char *my_cards, unsigned char *faced_card) {
   unsigned char game_cards[13];
   unsigned int i;
 
@@ -178,7 +186,29 @@ void distribute_cards(struct connection_data *condata, unsigned char *my_cards) 
     send_message(condata, 'D', game_cards[i], MESSAGE_TYPE_SEND_CARD);
   }
 
+  *faced_card = game_cards[12];
   send_message(condata, 0, game_cards[12], MESSAGE_TYPE_FACED_CARD);
+}
+
+void play_card(struct connection_data *condata, unsigned char *my_cards) {
+  unsigned char tag, suit;
+  unsigned int card_index;
+
+  fprintf(stdout, "Sua vez, escolha sua carta:\n");
+  show_cards(my_cards);
+
+  do {
+    fprintf(stdout, "> ");
+    fscanf(stdin, "%u", &card_index);
+  } while(card_index < 1 || card_index > 3 || !is_card_avaiable(my_cards[card_index - 1]));
+
+  tag = get_card_tag(my_cards[card_index - 1]);
+  suit = get_card_suit(my_cards[card_index - 1]);
+  fprintf(stdout, "Jogador %c jogou %c de %s\n", MACHINE_TAG, cards_tag[tag], cards_suit[suit]);
+  send_message(condata, 0, my_cards[card_index - 1], MESSAGE_TYPE_PLAY);
+
+  my_cards[card_index - 1] |= 0x80;
+  send_bat(condata);
 }
 
 int main(int argc, const char *argv[]) {
@@ -186,7 +216,6 @@ int main(int argc, const char *argv[]) {
   struct message msg;
   unsigned char my_cards[3];
   unsigned char faced_card, tag, suit, count = 0;
-  unsigned int card_index;
   socklen_t recvlen;
 
   if(confighost(&condata) < 0) {
@@ -198,41 +227,27 @@ int main(int argc, const char *argv[]) {
   #ifdef START_BAT
 
   fprintf(stdout, "Embaralhando e distribuindo cartas...\n");
-  distribute_cards(&condata, my_cards);
+  distribute_cards(&condata, my_cards, &faced_card);
   fprintf(stdout, "Feito!\n");
 
-  fprintf(stdout, "Sua vez, escolha sua carta:\n");
-  show_cards(my_cards);
-  fprintf(stdout, "> ");
-  fscanf(stdin, "%d", &card_index);
+  tag = get_card_tag(faced_card);
+  suit = get_card_suit(faced_card);
+  fprintf(stdout, "Carta virada: %c de %s\n", cards_tag[tag], cards_suit[suit]);
 
-  send_message(&condata, 0, my_cards[card_index - 1], MESSAGE_TYPE_PLAY);
-  fprintf(stdout, "Carta jogada!\n");
-
-  my_cards[card_index - 1] |= 0x80;
-  send_message(&condata, 0, 0, MESSAGE_TYPE_BAT);
+  play_card(&condata, my_cards);
 
   #endif
 
   while(1) {
     recvfrom(condata.sock, &msg, sizeof(struct message), 0, (struct sockaddr *) &condata.recaddr, &recvlen);
 
-    if(msg.sequence == current_seq && !(msg.read_flags & READ_FLAG)) {
+    if(msg.type == MESSAGE_TYPE_BAT || (msg.sequence == current_seq && !(msg.read_flags & READ_FLAG))) {
       msg.read_flags |= READ_FLAG;
 
       if(msg.dest == 0 || msg.dest == MACHINE_TAG) {
         switch(msg.type) {
           case MESSAGE_TYPE_BAT:
-            fprintf(stdout, "Sua vez, escolha sua carta:\n");
-            show_cards(my_cards);
-            fprintf(stdout, "> ");
-            fscanf(stdin, "%u", &card_index);
-
-            send_message(&condata, 0, my_cards[card_index - 1], MESSAGE_TYPE_PLAY);
-            fprintf(stdout, "Carta jogada!\n");
-
-            my_cards[card_index - 1] |= 0x80;
-            send_message(&condata, 0, 0, MESSAGE_TYPE_BAT);
+            play_card(&condata, my_cards);
             break;
 
           case MESSAGE_TYPE_FACED_CARD:
@@ -261,7 +276,9 @@ int main(int argc, const char *argv[]) {
         }
       }
 
-      current_seq = (current_seq + 1) % 0xFF;
+      if(msg.type != MESSAGE_TYPE_BAT) {
+        current_seq = (current_seq + 1) % 0xFF;
+      }
     }
 
     sendto(condata.sock, &msg, sizeof(struct message), 0, (struct sockaddr *) &condata.sndaddr, sizeof(struct sockaddr_in));
