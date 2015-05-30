@@ -1,5 +1,5 @@
 #define MACHINE_TAG             'A'
-#define MACHINE_HOST            "dalmore"
+#define MACHINE_HOST            "macalan"
 #define MACHINE_DEST_HOST       "talisker"
 #define MACHINE_SOURCE_PORT     63921
 #define MACHINE_DEST_PORT       63922
