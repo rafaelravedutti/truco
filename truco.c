@@ -13,6 +13,7 @@
 #define MESSAGE_TYPE_SEND_CARD      0x3
 #define MESSAGE_TYPE_PLAY           0x4
 #define MESSAGE_TYPE_RESET_WINNER   0x5
+#define MESSAGE_TYPE_NEW_MATCH      0x6
 
 #define NO_CARD                     ((unsigned char) -1)
 
@@ -94,6 +95,10 @@ int confighost(struct connection_data *cd) {
   return 0;
 }
 
+char next_tag(char tag, int offset) {
+  return ((tag - 'A' + offset) % 4) + 'A';
+}
+
 int is_card_avaiable(unsigned char card) {
   return !(card & 0x80);
 }
@@ -170,15 +175,15 @@ void distribute_cards(struct connection_data *condata, unsigned char *my_cards, 
   }
 
   for(i = 3; i < 6; ++i) {
-    send_message(condata, 'B', game_cards[i], MESSAGE_TYPE_SEND_CARD);
+    send_message(condata, next_tag(MACHINE_TAG, 1), game_cards[i], MESSAGE_TYPE_SEND_CARD);
   }
 
   for(i = 6; i < 9; ++i) {
-    send_message(condata, 'C', game_cards[i], MESSAGE_TYPE_SEND_CARD);
+    send_message(condata, next_tag(MACHINE_TAG, 2), game_cards[i], MESSAGE_TYPE_SEND_CARD);
   }
 
   for(i = 9; i < 12; ++i) {
-    send_message(condata, 'D', game_cards[i], MESSAGE_TYPE_SEND_CARD);
+    send_message(condata, next_tag(MACHINE_TAG, 3), game_cards[i], MESSAGE_TYPE_SEND_CARD);
   }
 
   *faced_card = game_cards[12];
@@ -203,6 +208,8 @@ void process_play(char card_owner, unsigned char card, unsigned char faced_card,
     if(card_tag == best_tag || card_tag > highest_tag) {
       *highest_card = card;
       *winner = card_owner;
+    } else if(card_tag == highest_tag) {
+      *winner = '?';
     }
   } else {
     if(card_tag == best_tag && get_card_suit(card) > get_card_suit(*highest_card)) {
@@ -233,11 +240,27 @@ void play_card(struct connection_data *condata, unsigned char *my_cards, unsigne
   my_cards[card_index - 1] |= 0x80;
 }
 
+void process_score(unsigned char *scores, unsigned char *round_wins) {
+  if(round_wins[0] != round_wins[1]) {
+    if(round_wins[0] > round_wins[1]) {
+      scores[0]++;
+      fprintf(stdout, "Fim da rodada! A equipe A e C venceu esta!\n");
+    } else {
+      scores[1]++;
+      fprintf(stdout, "Fim da rodada! A equipe B e D venceu esta!\n");
+    }
+  } else {
+    fprintf(stdout, "Fim da rodada! O resultado foi um empate!\n");
+  }
+
+  fprintf(stdout, "\nPontuação:\n\tEquipe A e C: %d pontos\n\tEquipe B e D: %d pontos\n\n", scores[0], scores[1]);
+}
+
 int main(int argc, const char *argv[]) {
   struct connection_data condata;
   struct message msg;
-  char winner;
-  unsigned char my_cards[3];
+  char winner, match_dealer;
+  unsigned char my_cards[3], scores[2], round_wins[2], draws, match_ended;
   unsigned char faced_card, highest_card, tag, suit, count = 0;
   socklen_t recvlen;
 
@@ -245,6 +268,10 @@ int main(int argc, const char *argv[]) {
     return -1;
   }
 
+  match_dealer = 'A';
+  match_ended = 0;
+  scores[0] = scores[1] = 0;
+  round_wins[0] = round_wins[1] = draws = 0;
   highest_card = NO_CARD;
   srand(time(NULL));
 
@@ -277,11 +304,38 @@ int main(int argc, const char *argv[]) {
         switch(msg.type) {
           case MESSAGE_TYPE_BAT:
             if(msg.source == MACHINE_TAG) {
-              msg.dest = winner;
-              highest_card = NO_CARD;
-              fprintf(stdout, "Jogador %c venceu esta rodada!\n", winner);
+              if(winner != '?') {
+                msg.dest = winner;
+              } else {
+                msg.dest = MACHINE_TAG;
+              }
 
+              if(winner != '?') {
+                fprintf(stdout, "Jogador %c venceu esta rodada!\n", winner);
+              } else {
+                fprintf(stdout, "Ocorreu um empate nesta rodada!\n");
+              }
+
+              if(winner == 'A' || winner == 'C') {
+                round_wins[0]++;
+              } else if(winner == 'B' || winner == 'D') {
+                round_wins[1]++;
+              } else {
+                draws++;
+              }
+
+              highest_card = NO_CARD;
               send_message(&condata, 0, 0, MESSAGE_TYPE_RESET_WINNER);
+
+              if((round_wins[0] + round_wins[1] + draws >= 3) || round_wins[0] > round_wins[1] + 1 || round_wins[1] > round_wins[0] + 1 || (round_wins[0] != round_wins[1] && draws > 0)) {
+                match_dealer = next_tag(match_dealer, 1);
+                match_ended = 1;
+                process_score(scores, round_wins);
+                round_wins[0] = round_wins[1] = draws = 0;
+                send_message(&condata, 0, 0, MESSAGE_TYPE_NEW_MATCH);
+
+                msg.dest = match_dealer;
+              }
             }
 
             if(msg.dest == 0) {
@@ -289,6 +343,18 @@ int main(int argc, const char *argv[]) {
             } else if(msg.dest == MACHINE_TAG) {
               msg.source = msg.dest;
               msg.dest = 0;
+
+              if(match_ended == 1) {
+                fprintf(stdout, "Embaralhando e distribuindo cartas...\n");
+                distribute_cards(&condata, my_cards, &faced_card);
+                fprintf(stdout, "Feito!\n");
+
+                tag = get_card_tag(faced_card);
+                suit = get_card_suit(faced_card);
+                fprintf(stdout, "Carta virada: %c de %s\n", cards_tag[tag], cards_suit[suit]);
+
+                match_ended = 0;
+              }
 
               play_card(&condata, my_cards, faced_card, &winner, &highest_card);
             }
@@ -301,6 +367,8 @@ int main(int argc, const char *argv[]) {
             tag = get_card_tag(faced_card);
             suit = get_card_suit(faced_card);
             fprintf(stdout, "Carta virada: %c de %s\n", cards_tag[tag], cards_suit[suit]);
+
+            match_ended = 0;
             break;
 
           case MESSAGE_TYPE_SEND_CARD:
@@ -312,6 +380,7 @@ int main(int argc, const char *argv[]) {
               show_cards(my_cards);
             }
 
+            match_ended = 0;
             break;
 
           case MESSAGE_TYPE_PLAY:
@@ -323,9 +392,29 @@ int main(int argc, const char *argv[]) {
             break;
 
           case MESSAGE_TYPE_RESET_WINNER:
+            if(winner == 'A' || winner == 'C') {
+              round_wins[0]++;
+            } else if(winner == 'B' || winner == 'D') {
+              round_wins[1]++;
+            } else {
+              draws++;
+            }
+
             highest_card = NO_CARD;
-            fprintf(stdout, "Jogador %c venceu esta rodada!\n", winner);
+
+            if(winner != '?') {
+              fprintf(stdout, "Jogador %c venceu esta rodada!\n", winner);
+            } else {
+              fprintf(stdout, "Ocorreu um empate nesta rodada!\n");
+            }
+
             break;
+
+          case MESSAGE_TYPE_NEW_MATCH:
+            match_dealer = next_tag(match_dealer, 1);
+            match_ended = 1;
+            process_score(scores, round_wins);
+            round_wins[0] = round_wins[1] = draws = 0;
         }
       }
 
