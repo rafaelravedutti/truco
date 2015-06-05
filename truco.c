@@ -16,6 +16,9 @@
 #define MESSAGE_TYPE_NEW_MATCH      0x6
 
 #define NO_CARD                     ((unsigned char) -1)
+#define TRUCO_ASK                   ((unsigned char) -2)
+#define TRUCO_ACCEPT                ((unsigned char) -3)
+#define TRUCO_REFUSE                ((unsigned char) -4)
 
 struct message {
   char source;
@@ -111,7 +114,7 @@ unsigned char get_card_suit(unsigned char card) {
   return card & 0x3;
 }
 
-void show_cards(unsigned char *my_cards) {
+void show_cards(unsigned char *my_cards, char truco_source, unsigned char match_points) {
   unsigned int i;
   unsigned char tag, suit;
 
@@ -119,7 +122,15 @@ void show_cards(unsigned char *my_cards) {
     if(is_card_avaiable(my_cards[i])) {
       tag = get_card_tag(my_cards[i]);
       suit = get_card_suit(my_cards[i]);
-      fprintf(stdout, "(%d) %c de %s\t", i + 1, cards_tag[tag], cards_suit[suit]);
+      fprintf(stdout, "(%d) %c de %s    ", i + 1, cards_tag[tag], cards_suit[suit]);
+    }
+  }
+
+  if(match_points > 0 && match_points < 12 && truco_source != MACHINE_TAG && truco_source != next_tag(MACHINE_TAG, 2)) {
+    if(match_points == 1) {
+      fprintf(stdout, "(4) Pedir Truco");
+    } else {
+      fprintf(stdout, "(4) Pedir %u", match_points + 3);
     }
   }
 
@@ -219,48 +230,74 @@ void process_play(char card_owner, unsigned char card, unsigned char faced_card,
   }
 }
 
-void play_card(struct connection_data *condata, unsigned char *my_cards, unsigned char faced_card, char *winner, unsigned char *highest_card) {
+void play_card(struct connection_data *condata, unsigned char *my_cards, unsigned char faced_card, unsigned char match_points, unsigned char *truco_asked, char *truco_source, char *winner, unsigned char *highest_card) {
   unsigned char tag, suit;
   unsigned int card_index;
 
   fprintf(stdout, "Sua vez, escolha sua carta:\n");
-  show_cards(my_cards);
+  show_cards(my_cards, *truco_source, match_points);
 
   do {
     fprintf(stdout, "> ");
     fscanf(stdin, "%u", &card_index);
-  } while(card_index < 1 || card_index > 3 || !is_card_avaiable(my_cards[card_index - 1]));
+  } while(card_index < 1 || card_index > 4 || (card_index != 4 && !is_card_avaiable(my_cards[card_index - 1])) || (card_index == 4 && (match_points >= 12 || *truco_source == MACHINE_TAG || *truco_source == next_tag(MACHINE_TAG, 2))));
 
-  tag = get_card_tag(my_cards[card_index - 1]);
-  suit = get_card_suit(my_cards[card_index - 1]);
-  fprintf(stdout, "Jogador %c jogou %c de %s\n", MACHINE_TAG, cards_tag[tag], cards_suit[suit]);
-  send_message(condata, 0, my_cards[card_index - 1], MESSAGE_TYPE_PLAY);
+  if(card_index != 4) {
+    tag = get_card_tag(my_cards[card_index - 1]);
+    suit = get_card_suit(my_cards[card_index - 1]);
+    fprintf(stdout, "Jogador %c jogou %c de %s\n", MACHINE_TAG, cards_tag[tag], cards_suit[suit]);
+    send_message(condata, 0, my_cards[card_index - 1], MESSAGE_TYPE_PLAY);
 
-  process_play(MACHINE_TAG, my_cards[card_index - 1], faced_card, winner, highest_card);
-  my_cards[card_index - 1] |= 0x80;
+    process_play(MACHINE_TAG, my_cards[card_index - 1], faced_card, winner, highest_card);
+    my_cards[card_index - 1] |= 0x80;
+  } else {
+    *truco_asked = 1;
+    *truco_source = MACHINE_TAG;
+
+    if(match_points == 1) {
+      fprintf(stdout, "Jogador %c pediu truco!\n", MACHINE_TAG);
+    } else {
+      fprintf(stdout, "Jogador %c pediu %d!\n", MACHINE_TAG, match_points + 3);
+    }
+
+    send_message(condata, 0, TRUCO_ASK, MESSAGE_TYPE_PLAY);
+  }
 }
 
-void process_score(unsigned char *scores, unsigned char *round_wins) {
+void process_score(unsigned char *scores, unsigned char *round_wins, unsigned char *draws, unsigned char *match_points) {
   if(round_wins[0] != round_wins[1]) {
     if(round_wins[0] > round_wins[1]) {
-      scores[0]++;
+      scores[0] += *match_points;
       fprintf(stdout, "Fim da rodada! A equipe A e C venceu esta!\n");
     } else {
-      scores[1]++;
+      scores[1] += *match_points;
       fprintf(stdout, "Fim da rodada! A equipe B e D venceu esta!\n");
     }
   } else {
     fprintf(stdout, "Fim da rodada! O resultado foi um empate!\n");
   }
 
-  fprintf(stdout, "\nPontuação:\n\tEquipe A e C: %d pontos\n\tEquipe B e D: %d pontos\n\n", scores[0], scores[1]);
+  *match_points = 1;
+  *draws = 0;
+  round_wins[0] = round_wins[1] = 0;
+  fprintf(stdout, "\nPontuação:\n  Equipe A e C: %d pontos\n  Equipe B e D: %d pontos\n\n", scores[0], scores[1]);
+}
+
+void truco_refuse(char truco_source, unsigned char *round_wins) {
+  if(truco_source == 'A' || truco_source == 'C') {
+    round_wins[0] = 2;
+    round_wins[1] = 0;
+  } else {
+    round_wins[0] = 0;
+    round_wins[1] = 2;
+  }
 }
 
 int main(int argc, const char *argv[]) {
   struct connection_data condata;
   struct message msg;
-  char winner, match_dealer;
-  unsigned char my_cards[3], scores[2], round_wins[2], draws, match_ended;
+  char winner, match_dealer, truco_source, answer;
+  unsigned char my_cards[3], scores[2], round_wins[2], draws, match_points, match_ended, truco_asked;
   unsigned char faced_card, highest_card, tag, suit, count = 0;
   socklen_t recvlen;
 
@@ -269,10 +306,13 @@ int main(int argc, const char *argv[]) {
   }
 
   match_dealer = 'A';
+  match_points = 1;
   match_ended = 0;
   scores[0] = scores[1] = 0;
   round_wins[0] = round_wins[1] = draws = 0;
   highest_card = NO_CARD;
+  truco_asked = 0;
+  truco_source = 0;
   srand(time(NULL));
 
   #ifdef START_BAT
@@ -285,7 +325,7 @@ int main(int argc, const char *argv[]) {
   suit = get_card_suit(faced_card);
   fprintf(stdout, "Carta virada: %c de %s\n", cards_tag[tag], cards_suit[suit]);
 
-  play_card(&condata, my_cards, faced_card, &winner, &highest_card);
+  play_card(&condata, my_cards, faced_card, match_points, &truco_asked, &truco_source, &winner, &highest_card);
 
   msg.type = MESSAGE_TYPE_BAT;
   msg.source = MACHINE_TAG;
@@ -303,63 +343,107 @@ int main(int argc, const char *argv[]) {
       if(msg.dest == 0 || msg.dest == MACHINE_TAG) {
         switch(msg.type) {
           case MESSAGE_TYPE_BAT:
-            if(msg.source == MACHINE_TAG) {
-              if(winner != '?') {
-                msg.dest = winner;
+            if(truco_asked != 0) {
+              if(msg.card == TRUCO_ACCEPT) {
+                match_points = (match_points == 1) ? 3 : (match_points + 3);
+                fprintf(stdout, "Jogador %c mandou cair!\n", next_tag(truco_source, 1));
+              } else if(msg.card == TRUCO_REFUSE) {
+                truco_refuse(truco_source, round_wins);
+                fprintf(stdout, "Jogador %c caiu fora...\n", next_tag(truco_source, 1));
               } else {
-                msg.dest = MACHINE_TAG;
+                fprintf(stdout, "Deseja aceitar o pedido? (y/n)\n");
+
+                do {
+                  fprintf(stdout, "> ");
+                  fscanf(stdin, "%c", &answer);
+                } while(answer != 'y' && answer != 'Y' && answer != 'n' && answer != 'N');
+
+                msg.card = (answer == 'y' || answer == 'Y') ? TRUCO_ACCEPT : TRUCO_REFUSE;
+
+                if(msg.card == TRUCO_ACCEPT) {
+                  match_points = (match_points == 1) ? 3 : (match_points + 3);
+                  fprintf(stdout, "Jogador %c mandou cair!\n", next_tag(truco_source, 1));
+                } else if(msg.card == TRUCO_REFUSE) {
+                  truco_refuse(truco_source, round_wins);
+                  fprintf(stdout, "Jogador %c caiu fora...\n", next_tag(truco_source, 1));
+                }
               }
 
-              if(winner != '?') {
-                fprintf(stdout, "Jogador %c venceu esta rodada!\n", winner);
-              } else {
-                fprintf(stdout, "Ocorreu um empate nesta rodada!\n");
+              if(truco_source == MACHINE_TAG) {
+                if(msg.card == TRUCO_ACCEPT) {
+                  play_card(&condata, my_cards, faced_card, match_points, &truco_asked, &truco_source, &winner, &highest_card);
+                } else {
+                  match_dealer = next_tag(match_dealer, 1);
+                  match_ended = 1;
+                  truco_source = 0;
+                  process_score(scores, round_wins, &draws, &match_points);
+                  send_message(&condata, 0, 0, MESSAGE_TYPE_NEW_MATCH);
+
+                  msg.dest = match_dealer;
+                }
+
+                msg.card = 0;
               }
 
-              if(winner == 'A' || winner == 'C') {
-                round_wins[0]++;
-              } else if(winner == 'B' || winner == 'D') {
-                round_wins[1]++;
-              } else {
-                draws++;
+              truco_asked = 0;
+            } else {
+              if(msg.source == MACHINE_TAG) {
+                if(winner != '?') {
+                  msg.dest = winner;
+                } else {
+                  msg.dest = MACHINE_TAG;
+                }
+
+                if(winner != '?') {
+                  fprintf(stdout, "Jogador %c venceu esta rodada!\n", winner);
+                } else {
+                  fprintf(stdout, "Ocorreu um empate nesta rodada!\n");
+                }
+
+                if(winner == 'A' || winner == 'C') {
+                  round_wins[0]++;
+                } else if(winner == 'B' || winner == 'D') {
+                  round_wins[1]++;
+                } else {
+                  draws++;
+                }
+
+                highest_card = NO_CARD;
+                send_message(&condata, 0, 0, MESSAGE_TYPE_RESET_WINNER);
+
+                if((round_wins[0] + round_wins[1] + draws >= 3) || round_wins[0] > round_wins[1] + 1 || round_wins[1] > round_wins[0] + 1 || (round_wins[0] != round_wins[1] && draws > 0)) {
+                  match_dealer = next_tag(match_dealer, 1);
+                  match_ended = 1;
+                  truco_source = 0;
+                  process_score(scores, round_wins, &draws, &match_points);
+                  send_message(&condata, 0, 0, MESSAGE_TYPE_NEW_MATCH);
+
+                  msg.dest = match_dealer;
+                }
               }
 
-              highest_card = NO_CARD;
-              send_message(&condata, 0, 0, MESSAGE_TYPE_RESET_WINNER);
+              if(msg.dest == 0) {
+                play_card(&condata, my_cards, faced_card, match_points, &truco_asked, &truco_source, &winner, &highest_card);
+              } else if(msg.dest == MACHINE_TAG) {
+                msg.source = msg.dest;
+                msg.dest = 0;
 
-              if((round_wins[0] + round_wins[1] + draws >= 3) || round_wins[0] > round_wins[1] + 1 || round_wins[1] > round_wins[0] + 1 || (round_wins[0] != round_wins[1] && draws > 0)) {
-                match_dealer = next_tag(match_dealer, 1);
-                match_ended = 1;
-                process_score(scores, round_wins);
-                round_wins[0] = round_wins[1] = draws = 0;
-                send_message(&condata, 0, 0, MESSAGE_TYPE_NEW_MATCH);
+                if(match_ended == 1) {
+                  fprintf(stdout, "Embaralhando e distribuindo cartas...\n");
+                  distribute_cards(&condata, my_cards, &faced_card);
+                  fprintf(stdout, "Feito!\n");
 
-                msg.dest = match_dealer;
+                  tag = get_card_tag(faced_card);
+                  suit = get_card_suit(faced_card);
+                  fprintf(stdout, "Carta virada: %c de %s\n", cards_tag[tag], cards_suit[suit]);
+
+                  match_ended = 0;
+                }
+
+                play_card(&condata, my_cards, faced_card, match_points, &truco_asked, &truco_source, &winner, &highest_card);
               }
             }
 
-            if(msg.dest == 0) {
-              play_card(&condata, my_cards, faced_card, &winner, &highest_card);
-            } else if(msg.dest == MACHINE_TAG) {
-              msg.source = msg.dest;
-              msg.dest = 0;
-
-              if(match_ended == 1) {
-                fprintf(stdout, "Embaralhando e distribuindo cartas...\n");
-                distribute_cards(&condata, my_cards, &faced_card);
-                fprintf(stdout, "Feito!\n");
-
-                tag = get_card_tag(faced_card);
-                suit = get_card_suit(faced_card);
-                fprintf(stdout, "Carta virada: %c de %s\n", cards_tag[tag], cards_suit[suit]);
-
-                match_ended = 0;
-              }
-
-              play_card(&condata, my_cards, faced_card, &winner, &highest_card);
-            }
-
-            sendto(condata.sock, &msg, sizeof(struct message), 0, (struct sockaddr *) &condata.sndaddr, sizeof(struct sockaddr_in));
             break;
 
           case MESSAGE_TYPE_FACED_CARD:
@@ -377,18 +461,30 @@ int main(int argc, const char *argv[]) {
 
             if(count == 0) {
               fprintf(stdout, "Suas cartas:\n");
-              show_cards(my_cards);
+              show_cards(my_cards, 0, 0);
             }
 
             match_ended = 0;
             break;
 
           case MESSAGE_TYPE_PLAY:
-            tag = get_card_tag(msg.card);
-            suit = get_card_suit(msg.card);
-            fprintf(stdout, "Jogador %c jogou %c de %s\n", msg.source, cards_tag[tag], cards_suit[suit]);
+            if(msg.card != TRUCO_ASK) {
+              tag = get_card_tag(msg.card);
+              suit = get_card_suit(msg.card);
+              fprintf(stdout, "Jogador %c jogou %c de %s\n", msg.source, cards_tag[tag], cards_suit[suit]);
 
-            process_play(msg.source, msg.card, faced_card, &winner, &highest_card);
+              process_play(msg.source, msg.card, faced_card, &winner, &highest_card);
+            } else {
+              truco_asked = 1;
+              truco_source = msg.source;
+
+              if(match_points == 1) {
+                fprintf(stdout, "Jogador %c pediu truco!\n", msg.source);
+              } else {
+                fprintf(stdout, "Jogador %c pediu %d!\n", msg.source, match_points + 3);
+              }
+            }
+
             break;
 
           case MESSAGE_TYPE_RESET_WINNER:
@@ -413,8 +509,9 @@ int main(int argc, const char *argv[]) {
           case MESSAGE_TYPE_NEW_MATCH:
             match_dealer = next_tag(match_dealer, 1);
             match_ended = 1;
-            process_score(scores, round_wins);
-            round_wins[0] = round_wins[1] = draws = 0;
+            truco_source = 0;
+            process_score(scores, round_wins, &draws, &match_points);
+            break;
         }
       }
 
